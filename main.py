@@ -1,22 +1,22 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Json
 import os
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+import logging
 
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 # --------------------------
 # Database connection
 # --------------------------
 def get_db_connection():
-
-    #database_url = os.getenv('DATABASE_URL')
-    database_url = "postgresql://yell_db_user:ax0gHANYc29tJEzbxBIqan0x0cujQ1AY@dpg-d4ks8lre5dus73febmlg-a.frankfurt-postgres.render.com/yell_db"
-
+    database_url = os.getenv('DATABASE_URL')
     if not database_url:
         raise Exception("DATABASE_URL environment variable is not set")
 
@@ -47,7 +47,7 @@ def create_tables():
             description TEXT,
             profile_image TEXT,
             location TEXT,
-            mobiles TEXT,
+            mobiles JSONB,
             reaching_video TEXT,
             social JSONB,
             type JSONB,
@@ -66,15 +66,26 @@ def create_tables():
 # --------------------------
 # Pydantic models
 # --------------------------
+class SocialModel(BaseModel):
+    instagram: Optional[str] = None
+    facebook: Optional[str] = None
+    snapchat: Optional[str] = None
+    telegram: Optional[str] = None
+    tiktok: Optional[str] = None
+
+class TypeModel(BaseModel):
+    main: Optional[str] = None
+    sub: Optional[str] = None
+
 class EntryBase(BaseModel):
     title: str
     description: Optional[str] = None
     profile_image: Optional[str] = None
     location: Optional[str] = None
-    mobiles: Optional[str] = None
+    mobiles: Optional[List[str]] = []  # Accept list of strings
     reaching_video: Optional[str] = None
-    social: Optional[Dict] = {}
-    type: Optional[Dict] = {}
+    social: Optional[SocialModel] = SocialModel()
+    type: Optional[TypeModel] = TypeModel()
 
 class EntryCreate(EntryBase):
     pass
@@ -84,10 +95,10 @@ class EntryUpdate(BaseModel):
     description: Optional[str] = None
     profile_image: Optional[str] = None
     location: Optional[str] = None
-    mobiles: Optional[str] = None
+    mobiles: Optional[List[str]] = None
     reaching_video: Optional[str] = None
-    social: Optional[Dict] = None
-    type: Optional[Dict] = None
+    social: Optional[SocialModel] = None
+    type: Optional[TypeModel] = None
 
 class EntryResponse(EntryBase):
     id: int
@@ -128,37 +139,61 @@ async def root():
 # --------------------------
 # CRUD Endpoints
 # --------------------------
-
-# CREATE
 @app.post("/entries", response_model=EntryResponse)
 async def create_entry(entry: EntryCreate):
-    conn = get_db_connection()
-    cur = conn.cursor(row_factory=dict_row)
+    logger.debug("🚀 POST /entries called")
+    logger.debug(f"Payload received: {entry.dict()}")
 
-    cur.execute("""
-        INSERT INTO entries (title, description, profile_image, location, mobiles, reaching_video, social, type)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        RETURNING *
-    """, (
-        entry.title,
-        entry.description,
-        entry.profile_image,
-        entry.location,
-        entry.mobiles,
-        entry.reaching_video,
-        entry.social,
-        entry.type
-    ))
+    try:
+        conn = get_db_connection()
+        logger.debug("✅ Database connection established")
 
-    new_entry = cur.fetchone()
-    conn.commit()
-    cur.close()
-    conn.close()
+        cur = conn.cursor(row_factory=dict_row)
+        logger.debug("✅ Cursor created")
 
-    # Convert datetime to ISO string
-    new_entry['created_at'] = new_entry['created_at'].isoformat()
-    new_entry['updated_at'] = new_entry['updated_at'].isoformat()
-    return new_entry
+        # Prepare values
+        values = (
+            entry.title,
+            entry.description,
+            entry.profile_image,
+            entry.location,
+            Json(entry.mobiles),  # list as JSONB
+            entry.reaching_video,
+            Json(entry.social.dict() if entry.social else {}),  # dict as JSONB
+            Json(entry.type.dict() if entry.type else {})       # dict as JSONB
+        )
+        logger.debug("DEBUG: Prepared values for insertion:")
+        for name, val in zip(
+            ["title","description","profile_image","location","mobiles","reaching_video","social","type"],
+            values
+        ):
+            logger.debug(f"{name}={val}")
+
+        cur.execute("""
+            INSERT INTO entries
+            (title, description, profile_image, location, mobiles, reaching_video, social, type)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+        """, values)
+
+        new_entry = cur.fetchone()
+        conn.commit()
+        logger.debug(f"✅ Entry inserted with ID {new_entry['id']}")
+
+        new_entry['created_at'] = new_entry['created_at'].isoformat()
+        new_entry['updated_at'] = new_entry['updated_at'].isoformat()
+
+        return new_entry
+
+    except Exception as e:
+        logger.error(f"❌ Error inserting entry: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+        logger.debug("✅ Database connection closed")
 
 # READ all
 @app.get("/entries", response_model=List[EntryResponse])
@@ -175,7 +210,6 @@ async def get_all_entries(
     cur.close()
     conn.close()
 
-    # Convert datetime to ISO strings
     for entry in entries:
         entry['created_at'] = entry['created_at'].isoformat()
         entry['updated_at'] = entry['updated_at'].isoformat()
@@ -211,7 +245,12 @@ async def update_entry(entry_id: int, new_data: EntryUpdate):
         raise HTTPException(status_code=400, detail="No fields to update")
 
     set_clause = ", ".join(f"{k} = %s" for k in fields.keys())
-    values = list(fields.values())
+    values = []
+    for k, v in fields.items():
+        if k in ['social', 'type']:
+            values.append(v.dict() if v else {})
+        else:
+            values.append(v)
     values.append(entry_id)
 
     cur.execute(f"UPDATE entries SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE id = %s RETURNING *", values)
@@ -241,6 +280,5 @@ async def delete_entry(entry_id: int):
 
     if not deleted:
         raise HTTPException(status_code=404, detail="Entry not found")
+
     return {"message": "Entry deleted successfully"}
-
-
