@@ -13,8 +13,10 @@ from datetime import datetime
 # Database connection
 # --------------------------
 def get_db_connection():
+
     #database_url = os.getenv('DATABASE_URL')
     database_url = "postgresql://yell_db_user:ax0gHANYc29tJEzbxBIqan0x0cujQ1AY@dpg-d4ks8lre5dus73febmlg-a.frankfurt-postgres.render.com/yell_db"
+
     if not database_url:
         raise Exception("DATABASE_URL environment variable is not set")
 
@@ -239,5 +241,6 @@ async def delete_entry(entry_id: int):
 
     if not deleted:
         raise HTTPException(status_code=404, detail="Entry not found")
-
     return {"message": "Entry deleted successfully"}
+
+
